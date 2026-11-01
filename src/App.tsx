@@ -13,9 +13,9 @@ import { PreviewOverlay } from './components/PreviewOverlay';
 import { ExportPanel } from './components/ExportPanel';
 import { getInitialPages, createFrame, createLayer } from './utils/presets';
 import { getPolygonBounds } from './utils/geometry';
-import { Undo, Redo, Eye, Download, Sparkles, SlidersHorizontal, BookOpen, Plus, Settings, FileText, Layers } from 'lucide-react';
-
-const LOCAL_STORAGE_KEY = 'vibeco_app_state_v1';
+import { downloadProjectFile, parseProjectFile, serializeProjectFile } from './utils/projectFiles';
+import { LEGACY_LOCAL_STORAGE_KEY, loadAutosave, saveAutosave } from './utils/projectAutosave';
+import { Undo, Redo, Eye, Download, Sparkles, SlidersHorizontal, BookOpen, Plus, Settings, FileText, Layers, FolderOpen, Save } from 'lucide-react';
 
 const NeobrutalistTooltip: React.FC<{ text: string; children: React.ReactNode }> = ({ text, children }) => {
   return (
@@ -29,8 +29,17 @@ const NeobrutalistTooltip: React.FC<{ text: string; children: React.ReactNode }>
 };
 
 export default function App() {
-  // Global application variables
-  const [state, setState] = useState<AppState | null>(null);
+  // The ref keeps synchronous access to the newest document for pointer callbacks,
+  // autosave, and undo snapshots, even before React has rendered again.
+  const [state, setReactState] = useState<AppState | null>(null);
+  const stateRef = useRef<AppState | null>(null);
+  const setState = (nextState: AppState | null | ((previous: AppState | null) => AppState | null)) => {
+    const resolvedState = typeof nextState === 'function'
+      ? (nextState as (previous: AppState | null) => AppState | null)(stateRef.current)
+      : nextState;
+    stateRef.current = resolvedState;
+    setReactState(resolvedState);
+  };
 
   // Active Tool state lifted from Workspace
   const [activeTool, setActiveTool] = useState<'select' | 'vertex' | 'knife' | 'add-rect' | 'add-poly' | 'pressure' | 'brush' | 'eraser'>('select');
@@ -52,9 +61,16 @@ export default function App() {
   const [brushStabilizer, setBrushStabilizer] = useState<'smooth' | 'lazy'>('smooth');
   const [lazyRadius, setLazyRadius] = useState<number>(20);
 
-  // Undo/Redo historical stack
-  const [history, setHistory] = useState<Page[][]>([]);
+  // History stores whole document snapshots, not just page arrays.
+  const [history, setHistory] = useState<AppState[]>([]);
+  const historyRef = useRef<AppState[]>([]);
   const [historyIdx, setHistoryIdx] = useState<number>(-1);
+  const historyIdxRef = useRef<number>(-1);
+  const pendingSnapshotTimerRef = useRef<number | null>(null);
+  const autosaveTimerRef = useRef<number | null>(null);
+  const projectFileInputRef = useRef<HTMLInputElement>(null);
+  const projectFileHandleRef = useRef<any>(null);
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
   // Active user selections
   const [selectedLayerId, setSelectedLayerId] = useState<number | null>(null);
@@ -67,37 +83,84 @@ export default function App() {
   const [showExport, setShowExport] = useState<boolean>(false);
   const [showDialog, setShowDialog] = useState<boolean>(false);
 
-  // Check LocalStorage on initial mount
+  const resetHistory = (documentState: AppState) => {
+    if (pendingSnapshotTimerRef.current !== null) {
+      window.clearTimeout(pendingSnapshotTimerRef.current);
+      pendingSnapshotTimerRef.current = null;
+    }
+    const firstSnapshot = JSON.parse(JSON.stringify(documentState)) as AppState;
+    historyRef.current = [firstSnapshot];
+    historyIdxRef.current = 0;
+    setHistory(historyRef.current);
+    setHistoryIdx(0);
+  };
+
+  // Restore the last working copy. Migrate the old localStorage document once.
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(LOCAL_STORAGE_KEY);
-      if (stored) {
-        const parsed = JSON.parse(stored) as AppState;
-        if (parsed.pages && parsed.pages.length > 0) {
-          setState(parsed);
-          // Seed initial history
-          setHistory([JSON.parse(JSON.stringify(parsed.pages))]);
-          setHistoryIdx(0);
-          return;
+    let cancelled = false;
+    const restoreDocument = async () => {
+      let restored: AppState | null = null;
+      try {
+        restored = await loadAutosave();
+      } catch (error) {
+        console.warn('Could not read IndexedDB autosave; trying legacy browser storage.', error);
+      }
+
+      if (!restored) {
+        try {
+          const legacy = localStorage.getItem(LEGACY_LOCAL_STORAGE_KEY);
+          if (legacy) restored = parseProjectFile(legacy);
+        } catch (error) {
+          console.warn('Could not restore the previous browser project.', error);
         }
       }
-    } catch (e) {
-      console.warn('Could not read from local storage', e);
-    }
-    // If no storage, show setup dialog immediately
-    setShowDialog(true);
+
+      if (cancelled) return;
+      if (restored) {
+        setState(restored);
+        resetHistory(restored);
+        setSaveStatus('saved');
+      } else {
+        setShowDialog(true);
+      }
+    };
+
+    void restoreDocument();
+    return () => { cancelled = true; };
   }, []);
 
-  // Update localStorage whenever state is customized
+  // IndexedDB autosave is asynchronous and debounced. During continuous edits,
+  // a save is still started at least once per second rather than on every pointer move.
   useEffect(() => {
-    if (state) {
+    if (!state) return;
+    setSaveStatus('saving');
+    if (autosaveTimerRef.current !== null) return;
+
+    autosaveTimerRef.current = window.setTimeout(async () => {
+      autosaveTimerRef.current = null;
+      const documentToSave = stateRef.current;
+      if (!documentToSave) return;
       try {
-        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state));
-      } catch (e) {
-        console.warn('Could not write state to local storage', e);
+        await saveAutosave(documentToSave);
+        if (stateRef.current === documentToSave) setSaveStatus('saved');
+      } catch (error) {
+        console.error('Autosave failed.', error);
+        if (stateRef.current === documentToSave) setSaveStatus('error');
       }
-    }
+    }, 1000);
   }, [state]);
+
+  // Warn if the browser is closed before the asynchronous autosave finishes.
+  useEffect(() => {
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+      if (saveStatus === 'saving' || saveStatus === 'error') {
+        event.preventDefault();
+        event.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', warnBeforeLeaving);
+    return () => window.removeEventListener('beforeunload', warnBeforeLeaving);
+  }, [saveStatus]);
 
   // Handle auto-closing and clearing layers panel when leaving 'select' mode
   useEffect(() => {
@@ -107,46 +170,72 @@ export default function App() {
     }
   }, [activeTool]);
 
-  // Deep snapshot history helper
+  // Deep snapshot history helper. The current AppState is read from a ref so
+  // callbacks fired immediately after setState don't capture the previous render.
   const handleSnapshot = (customPages?: Page[]) => {
-    if (!state) return;
-    const targetPages = customPages || state.pages;
-    const pagesCopy = JSON.parse(JSON.stringify(targetPages)) as Page[];
-    
-    const nextHist = history.slice(0, historyIdx + 1);
-    nextHist.push(pagesCopy);
-    if (nextHist.length > 30) {
-      nextHist.shift();
+    if (pendingSnapshotTimerRef.current !== null) {
+      window.clearTimeout(pendingSnapshotTimerRef.current);
+      pendingSnapshotTimerRef.current = null;
     }
-    setHistory(nextHist);
-    setHistoryIdx(nextHist.length - 1);
+    const currentDocument = stateRef.current;
+    if (!currentDocument) return;
+
+    const documentToSnapshot = customPages
+      ? { ...currentDocument, pages: customPages }
+      : currentDocument;
+    const snapshot = JSON.parse(JSON.stringify(documentToSnapshot)) as AppState;
+    const nextHistory = historyRef.current.slice(0, historyIdxRef.current + 1);
+    nextHistory.push(snapshot);
+    if (nextHistory.length > 30) nextHistory.shift();
+
+    historyRef.current = nextHistory;
+    historyIdxRef.current = nextHistory.length - 1;
+    setHistory(nextHistory);
+    setHistoryIdx(nextHistory.length - 1);
+  };
+
+  // Some property-panel edits don't have a pointer-up event. Group their rapid
+  // updates into one undo step; workspace gestures flush this on pointer-up.
+  const scheduleSnapshot = () => {
+    if (pendingSnapshotTimerRef.current !== null) {
+      window.clearTimeout(pendingSnapshotTimerRef.current);
+    }
+    pendingSnapshotTimerRef.current = window.setTimeout(() => {
+      pendingSnapshotTimerRef.current = null;
+      handleSnapshot();
+    }, 300);
   };
 
   const handleUndo = () => {
-    if (historyIdx <= 0 || !state) return;
-    const prevIdx = historyIdx - 1;
-    const prevPages = JSON.parse(JSON.stringify(history[prevIdx])) as Page[];
-    setHistoryIdx(prevIdx);
-    setState({
-      ...state,
-      pages: prevPages,
-    });
-    // Reset transient panels
+    if (pendingSnapshotTimerRef.current !== null) handleSnapshot();
+    const currentIndex = historyIdxRef.current;
+    if (currentIndex <= 0 || !stateRef.current) return;
+    const previousIndex = currentIndex - 1;
+    const previousDocument = JSON.parse(JSON.stringify(historyRef.current[previousIndex])) as AppState;
+    historyIdxRef.current = previousIndex;
+    setHistoryIdx(previousIndex);
+    setState(previousDocument);
     setSelectedLayerId(null);
+    setSelectedLayerIds([]);
     setActiveLayers(null);
+    setSelectedFrameIds([]);
+    setSelVertices([]);
   };
 
   const handleRedo = () => {
-    if (historyIdx >= history.length - 1 || !state) return;
-    const nextIdx = historyIdx + 1;
-    const nextPages = JSON.parse(JSON.stringify(history[nextIdx])) as Page[];
-    setHistoryIdx(nextIdx);
-    setState({
-      ...state,
-      pages: nextPages,
-    });
+    if (pendingSnapshotTimerRef.current !== null) handleSnapshot();
+    const currentIndex = historyIdxRef.current;
+    if (currentIndex >= historyRef.current.length - 1 || !stateRef.current) return;
+    const nextIndex = currentIndex + 1;
+    const nextDocument = JSON.parse(JSON.stringify(historyRef.current[nextIndex])) as AppState;
+    historyIdxRef.current = nextIndex;
+    setHistoryIdx(nextIndex);
+    setState(nextDocument);
     setSelectedLayerId(null);
+    setSelectedLayerIds([]);
     setActiveLayers(null);
+    setSelectedFrameIds([]);
+    setSelVertices([]);
   };
 
   // Setup global shortcuts
@@ -292,7 +381,7 @@ export default function App() {
   }, [historyIdx, history, state, selectedLayerId, selectedLayerIds, activeLayers, selectedFrameIds, activeTool, selVertices, setSelVertices, editingFrameId]);
 
   // Project initialization
-  const handleStartProject = (config: {
+  const handleStartProject = async (config: {
     width: number;
     height: number;
     borderWidth: number;
@@ -302,6 +391,18 @@ export default function App() {
     pageBg: string;
     pagesCount: number;
   }) => {
+    const currentDocument = stateRef.current;
+    if (currentDocument) {
+      const confirmed = window.confirm('Создать новый проект? Текущая рабочая копия будет заменена. Если нужен отдельный файл, сначала сохраните проект.');
+      if (!confirmed) return;
+      try {
+        await saveAutosave(currentDocument);
+      } catch (error) {
+        console.error('Could not protect the current project before starting a new one.', error);
+        if (!window.confirm('Не удалось создать резервную рабочую копию. Всё равно продолжить и заменить проект?')) return;
+      }
+    }
+
     // Generate beautiful initial Pages styled dynamically
     const initialPages = getInitialPages(config.width, config.height);
 
@@ -331,11 +432,90 @@ export default function App() {
     };
 
     setState(appState);
-    setHistory([JSON.parse(JSON.stringify(initialPages))]);
-    setHistoryIdx(0);
+    resetHistory(appState);
+    projectFileHandleRef.current = null;
     setSelectedLayerId(null);
     setActiveLayers(null);
     setShowDialog(false);
+  };
+
+  const handleSaveProject = async () => {
+    const documentToSave = stateRef.current;
+    if (!documentToSave) return;
+
+    const pickerWindow = window as any;
+    if (typeof pickerWindow.showSaveFilePicker === 'function') {
+      try {
+        let fileHandle = projectFileHandleRef.current;
+        if (!fileHandle) {
+          fileHandle = await pickerWindow.showSaveFilePicker({
+            suggestedName: `VIBECOMIX-${new Date().toISOString().slice(0, 10)}.vibeco`,
+            types: [{
+              description: 'VIBECOMIX project',
+              accept: { 'application/json': ['.vibeco'] },
+            }],
+          });
+        }
+        const writable = await fileHandle.createWritable();
+        await writable.write(serializeProjectFile(documentToSave));
+        await writable.close();
+        projectFileHandleRef.current = fileHandle;
+        setSaveStatus('saved');
+        return;
+      } catch (error) {
+        if ((error as any)?.name === 'AbortError') return;
+        console.warn('File System Access API unavailable; downloading a project copy instead.', error);
+        projectFileHandleRef.current = null;
+      }
+    }
+
+    try {
+      downloadProjectFile(documentToSave);
+      setSaveStatus('saved');
+    } catch (error) {
+      console.error('Could not export the project file.', error);
+      window.alert('Не удалось сохранить проект. Попробуйте освободить место и повторить.');
+    }
+  };
+
+  const handleProjectFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+
+    if (stateRef.current && !window.confirm('Открыть другой проект? Рабочая копия текущего документа будет заменена. Если нужен отдельный файл, сначала нажмите «Сохранить проект».')) {
+      input.value = '';
+      return;
+    }
+
+    try {
+      const importedDocument = parseProjectFile(await file.text());
+      const currentDocument = stateRef.current;
+      if (currentDocument) {
+        try {
+          await saveAutosave(currentDocument);
+        } catch (error) {
+          console.error('Could not save the current document before opening another project.', error);
+          const proceed = window.confirm('Не удалось сохранить текущий проект. Всё равно открыть выбранный файл?');
+          if (!proceed) return;
+        }
+      }
+
+      setState(importedDocument);
+      resetHistory(importedDocument);
+      projectFileHandleRef.current = null;
+      setSelectedLayerId(null);
+      setSelectedLayerIds([]);
+      setActiveLayers(null);
+      setSelectedFrameIds([]);
+      setSelVertices([]);
+      setShowDialog(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Не удалось открыть файл проекта.';
+      window.alert(message);
+    } finally {
+      input.value = '';
+    }
   };
 
   if (!state) {
@@ -563,6 +743,7 @@ export default function App() {
       ...state,
       pages: nextPages,
     });
+    scheduleSnapshot();
   };
 
   const handleModifyFrame = (frameId: number, modifications: Partial<Frame>) => {
@@ -812,6 +993,13 @@ export default function App() {
 
   return (
     <div className="h-screen bg-[#0D0D0D] text-[#F5F0E8] flex flex-col overflow-hidden select-none">
+      <input
+        ref={projectFileInputRef}
+        type="file"
+        accept=".vibeco,.json,application/json"
+        className="hidden"
+        onChange={handleProjectFileChange}
+      />
       {/* Dynamic top info & operational bar */}
       <header className="h-[52px] bg-[#141210] border-b-4 border-[#3A3228] flex items-center justify-between shrink-0 select-none px-4 z-50">
         {/* Left Side branding & settings */}
@@ -826,6 +1014,12 @@ export default function App() {
             <span>/</span>
             <span>{state.pages.length}</span>
           </div>
+          <span
+            className={`hidden xl:inline font-mono text-[8px] uppercase tracking-wide ${saveStatus === 'error' ? 'text-[#FC018D]' : 'text-[#7A7470]'}`}
+            title={saveStatus === 'error' ? 'Автосохранение не удалось. Скачайте копию проекта.' : 'Рабочая копия сохраняется в этом браузере.'}
+          >
+            {saveStatus === 'saving' ? 'Автосохранение…' : saveStatus === 'error' ? 'Ошибка сохранения' : saveStatus === 'saved' ? 'Сохранено' : ''}
+          </span>
 
           {/* Dynamic page resolution and style overrides form */}
           <div className="hidden lg:flex items-center gap-2 border-l border-[#3A3228] pl-3.5 mx-1.5 h-full">
@@ -1064,6 +1258,22 @@ export default function App() {
           </button>
 
           <button
+            onClick={() => projectFileInputRef.current?.click()}
+            className="p-2 border border-[#3A3228] hover:border-[#339EEE] text-[#7A7470] hover:text-[#339EEE] rounded cursor-pointer transition-colors"
+            title="Открыть файл проекта VIBECOMIX"
+            aria-label="Открыть проект"
+          >
+            <FolderOpen size={13} />
+          </button>
+          <button
+            onClick={handleSaveProject}
+            className="p-2 border border-[#3A3228] hover:border-[#339EEE] text-[#7A7470] hover:text-[#339EEE] rounded cursor-pointer transition-colors"
+            title="Сохранить проект в файл VIBECOMIX"
+            aria-label="Сохранить проект"
+          >
+            <Save size={13} />
+          </button>
+          <button
             onClick={() => setShowDialog(true)}
             className="flex items-center gap-1.5 px-2.5 py-1.5 border border-[#3A3228] hover:border-[#339EEE] text-[#7A7470] hover:text-[#339EEE] font-mono text-[9px] uppercase tracking-wider rounded select-none cursor-pointer transition-colors duration-150"
             title="Создать полностью новый проект комикса"
@@ -1234,7 +1444,12 @@ export default function App() {
                   onSelectFrame={setActiveLayers}
                   onSelectFrameIds={setSelectedFrameIds}
                   onUpdatePageState={handleUpdatePageState}
-                  onUpdateGlobalConfig={(mods) => setState((prev) => (prev ? { ...prev, ...mods } : prev))}
+                  onUpdateGlobalConfig={(mods) => {
+                    const currentDocument = stateRef.current;
+                    if (!currentDocument) return;
+                    setState({ ...currentDocument, ...mods });
+                    handleSnapshot();
+                  }}
                   onSnapshot={() => handleSnapshot()}
                   viewportEditFrameId={editingFrameId}
                   onSetViewportEditFrameId={setEditingFrameId}

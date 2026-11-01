@@ -5,9 +5,10 @@
 
 import { Page, Frame, Layer } from '../types';
 
-export const DEFAULT_BG = '/src/assets/images/cyberpunk_bg_1780281822261.png';
-export const DEFAULT_HERO = '/src/assets/images/cyberpunk_hero_1780281838230.png';
-export const DEFAULT_FG = '/src/assets/images/cyberpunk_fg_1780281857992.png';
+// Use Vite-managed asset URLs so the sample images also work in production builds.
+export const DEFAULT_BG = new URL('../assets/images/cyberpunk_bg_1780281822261.png', import.meta.url).href;
+export const DEFAULT_HERO = new URL('../assets/images/cyberpunk_hero_1780281838230.png', import.meta.url).href;
+export const DEFAULT_FG = new URL('../assets/images/cyberpunk_fg_1780281857992.png', import.meta.url).href;
 
 // High-quality public CDN placeholders as backups or extra assets
 export const SAMPLE_ASSETS = [
