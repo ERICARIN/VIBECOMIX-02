@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/utils/projectFiles.test.ts"
+    "test": "tsx --test src/utils/projectFiles.test.ts src/utils/exporter.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -17,6 +17,7 @@
     "@vitejs/plugin-react": "^5.0.4",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "gifenc": "^1.0.3",
     "jszip": "^3.10.1",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
