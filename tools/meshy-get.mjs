@@ -54,6 +54,7 @@ function parseArgv(argv) {
     else if (a === '--host') o.host = next();
     else if (a === '--no-open') o.open = false;
     else if (a === '--fbx') o.fbx = true;
+    else if (a === '--doctor') o.doctor = true;
     else if (a.startsWith('-')) throw new Error(`Неизвестная опция ${a}`);
     else o.links.push(a);
   }
@@ -73,6 +74,7 @@ meshy-get — вставь ссылку Meshy, получи GLB
   --host <h>    адрес прослушивания (по умолчанию 127.0.0.1)
   --no-open     не открывать браузер автоматически
   --fbx         конвертировать в FBX через Blender, если он найден
+  --doctor      самопроверка: Node, сеть до Meshy, загрузка декриптора, подпись
   -h, --help    эта справка
 
 Переменные окружения: MESHY_OUT, BLENDER, MESHY_BASE.
@@ -174,19 +176,25 @@ async function fetchBuffer(url, onProgress) {
 }
 
 // ─── расшифровка .meshy (как это делает вьювер Meshy) ────────────────────────
-function signature(hostname, timestamp) {
-  const M = BigInt('0xFFFFFFFFFFFFFFFF');
-  let r = BigInt('14695981039346656037');
-  const prime = BigInt('1099511628211');
-  const data = `${hostname}:${timestamp}` + 'Meshy_Crypto_Key';
-  for (let i = 0; i < data.length; i++) {
-    r ^= BigInt(data.charCodeAt(i));
-    r = (r * prime) & M;
+// Подпись = 64-битный хеш (FNV-1a + финализатор murmur3) от строки "host:timestamp",
+// но ключ "Meshy_Crypto_Key" прогоняется ЧЕРЕЗ ХЕШ ПЕРВЫМ, и хеширование продолжается
+// на "host:timestamp". Два прохода — не один; именно на этом ломалась первая версия.
+const M64 = BigInt('0xFFFFFFFFFFFFFFFF');
+const FNV_OFFSET = BigInt('14695981039346656037');
+const FNV_PRIME = BigInt('1099511628211');
+
+function meshySignature(hostname, timestamp) {
+  let r = FNV_OFFSET;
+  for (const part of ['Meshy_Crypto_Key', `${hostname}:${timestamp}`]) {
+    for (let i = 0; i < part.length; i++) {
+      r ^= BigInt(part.charCodeAt(i));
+      r = (r * FNV_PRIME) & M64;
+    }
   }
   r ^= r >> BigInt(33);
-  r = (r * BigInt('0xff51afd7ed558ccd')) & M;
+  r = (r * BigInt('0xff51afd7ed558ccd')) & M64;
   r ^= r >> BigInt(33);
-  r = (r * BigInt('0xc4ceb9fe1a85ec53')) & M;
+  r = (r * BigInt('0xc4ceb9fe1a85ec53')) & M64;
   r ^= r >> BigInt(33);
   return r.toString(16).padStart(16, '0');
 }
@@ -209,7 +217,7 @@ function ensureLoader() {
       } catch {}
       if (!ok) {
         const res = await fetch(LOADER_BASE + name, { headers: { 'user-agent': UA } });
-        if (!res.ok) throw new Error(`не удалось загрузить ${name} (HTTP ${res.status})`);
+        if (!res.ok) throw new Error(`не удалось скачать декриптор Meshy ${name} (HTTP ${res.status})`);
         const buf = Buffer.from(await res.arrayBuffer());
         if (magic && !buf.subarray(0, magic.length).equals(magic)) throw new Error(`${name} повреждён`);
         await fsp.writeFile(p, buf);
@@ -221,16 +229,38 @@ function ensureLoader() {
   return loaderPromise;
 }
 
-async function decryptMeshy(buf) {
+// Какие hostname пробовать: имя Meshy, к которому стучимся, и канонические.
+function hostCandidates() {
+  const list = [];
+  try {
+    list.push(new URL(BASE).hostname);
+  } catch {}
+  list.push('www.meshy.ai', 'meshy.ai');
+  return [...new Set(list.filter(Boolean))];
+}
+
+async function initDecryptor() {
   const { js, wasm } = await ensureLoader();
-  const hostname = new URL(BASE).hostname || 'www.meshy.ai';
-  const timestamp = Date.now();
   const { default: init } = await import(pathToFileURL(js).href);
   const mod = await init({ locateFile: (p) => (p.endsWith('.wasm') ? wasm : p) });
-  if (!mod.authorize(hostname, timestamp, signature(hostname, timestamp)))
-    throw new Error('декриптор Meshy отклонил подпись (изменился формат — попробуй позже)');
+  for (const hostname of hostCandidates()) {
+    const ts = Date.now();
+    if (mod.authorize(hostname, ts, meshySignature(hostname, ts))) return { mod, hostname };
+  }
+  throw new Error(
+    'декриптор Meshy отклонил подпись — вероятно, Meshy снова сменил формат. ' +
+      'Запусти с флагом --doctor и пришли вывод.',
+  );
+}
+
+let decryptorPromise = null;
+const getDecryptor = () => (decryptorPromise ??= initDecryptor());
+
+async function decryptMeshy(buf) {
+  const { mod } = await getDecryptor();
   const res = mod.processMeshyFile(new Uint8Array(buf));
-  if (!res || !res.success || !res.data) throw new Error(`расшифровка не удалась: ${res?.error || 'unknown'}`);
+  if (!res || !res.success || !res.data)
+    throw new Error(`не удалось расшифровать файл: ${res?.error || 'неизвестная ошибка'}`);
   return Buffer.from(res.data.buffer, res.data.byteOffset, res.data.byteLength);
 }
 
@@ -258,7 +288,14 @@ function findBlender() {
         ? ['/Applications/Blender.app/Contents/MacOS/Blender']
         : ['/usr/bin/blender', '/usr/local/bin/blender', '/snap/bin/blender'];
   for (const c of candidates) if (fs.existsSync(c)) return c;
-  return null; // «blender» в PATH проверяется при первом запуске
+  // последняя попытка — blender из PATH
+  for (const dir of (process.env.PATH || '').split(path.delimiter)) {
+    const p = path.join(dir, process.platform === 'win32' ? 'blender.exe' : 'blender');
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {}
+  }
+  return null;
 }
 
 async function toFbx(glbPath, fbxPath, blenderBin) {
@@ -275,6 +312,59 @@ bpy.ops.export_scene.fbx(filepath=${JSON.stringify(fbxPath)}, embed_textures=Tru
     });
   });
   return fbxPath;
+}
+
+// ─── самопроверка (--doctor) ────────────────────────────────────────────────
+async function doctor() {
+  const ok = (b) => (b ? '  OK  ' : ' ОШИБКА');
+  let bad = 0;
+  const check = (name, passed, extra = '', { optional = false } = {}) => {
+    if (!passed && !optional) bad++;
+    const tag = passed ? '  OK  ' : optional ? ' ВНИМ ' : ' ОШИБКА';
+    console.log(`${tag} · ${name}${extra ? ' — ' + extra : ''}`);
+  };
+
+  check('Node.js >= 18', Number(process.versions.node.split('.')[0]) >= 18, `у тебя ${process.versions.node}`);
+  check('папка для файлов доступна', true, defaultOutDir());
+
+  let reach = false;
+  let ver = '';
+  try {
+    const r = await fetch(`${BASE}/`, { headers: { 'user-agent': UA } });
+    reach = true;
+    ver = `HTTP ${r.status}`;
+  } catch (e) {
+    ver = e.message;
+  }
+  check(`сеть до ${BASE}`, reach, ver);
+
+  let loaderOk = false;
+  try {
+    const { js, wasm } = await ensureLoader();
+    const [a, b] = await Promise.all([fsp.readFile(js), fsp.readFile(wasm)]);
+    loaderOk = a.length > 1000 && b.length > 1000 && b.subarray(0, 4).equals(Buffer.from([0x00, 0x61, 0x73, 0x6d]));
+    console.log(
+      `        декриптор: ${path.dirname(js)} (js ${(a.length / 1024).toFixed(0)} КБ, wasm ${(b.length / 1024).toFixed(0)} КБ)`,
+    );
+  } catch (e) {
+    console.log(`        ${e.message}`);
+  }
+  check('декриптор Meshy скачан и цел', loaderOk, loaderOk ? '' : 'файлы неполные/отсутствуют');
+
+  if (loaderOk) {
+    try {
+      const { hostname } = await getDecryptor();
+      check('подпись принята wasm (authorize)', true, `hostname=${hostname}`);
+    } catch (e) {
+      check('подпись принята wasm (authorize)', false, e.message);
+    }
+  }
+
+  const blender = findBlender();
+  check('Blender для FBX', !!blender, blender || 'не найден — GLB всё равно работает', { optional: true });
+
+  console.log(bad ? `\n  Проблем: ${bad}. См. строки «ОШИБКА» выше.\n` : '\n  Всё в порядке — можно скачивать.\n');
+  process.exit(bad ? 1 : 0);
 }
 
 // ─── собственно скачивание ──────────────────────────────────────────────────
@@ -518,6 +608,8 @@ async function main() {
   }
   const outDir = opts.out ? opts.out.replace(/^~(?=$|\/)/, os.homedir()) : defaultOutDir();
   await fsp.mkdir(outDir, { recursive: true });
+
+  if (opts.doctor) return doctor();
 
   // CLI-режим: ссылки переданы аргументами
   if (opts.links.length) {
