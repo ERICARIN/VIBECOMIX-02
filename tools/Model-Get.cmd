@@ -7,5 +7,5 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-node tools\meshy-get.mjs %*
+node tools\model-get.mjs %*
 if errorlevel 1 pause

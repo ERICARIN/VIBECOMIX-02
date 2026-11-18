@@ -1,26 +1,29 @@
 #!/usr/bin/env node
 /**
- * meshy-get.mjs — «вставь ссылку Meshy и получи файл».
+ * model-get.mjs — «вставь ссылку на модель, получи файл».
  *
- * Один файл, без зависимостей (Node >= 18). Поднимает локальный веб-интерфейс:
- *   - вставляешь одну или несколько ссылок (www.meshy.ai/s/XXXX, /3d-models/... или task-id);
- *   - жмёшь «Скачать»;
- *   - скрипт сам: редирект короткой ссылки -> task-API -> скачивание ассета ->
- *     расшифровка model.meshy через mesh_loader.wasm -> валидация GLB;
- *   - файл кладётся в папку (по умолчанию ~/Downloads/meshy) и сразу отдаётся
- *     браузеру как обычное скачивание.
+ * Один файл, без зависимостей (Node >= 18). Понимает две площадки и сам
+ * определяет, какая перед ним:
  *
- * Запуск:
- *   node tools/meshy-get.mjs
- *   node tools/meshy-get.mjs --port 7900 --no-open
- *   node tools/meshy-get.mjs --out "/Users/me/Models/Meshy"
+ *   • Meshy  — https://www.meshy.ai/s/XXXX, /3d-models/<slug>-<uuid>, или task-id
+ *     путь: редирект -> task-API -> model.meshy -> расшифровка mesh_loader.wasm -> GLB
+ *   • Tripo  — https://studio.tripo3d.ai/workspace/.../<uuid>, /3d-model/<uuid>, /s/<code>
+ *     путь: project-API -> подписанный model_url (glb/fbx/...) -> скачивание как есть
  *
- * Поддерживается и просто CLI-режим (без окна):
- *   node tools/meshy-get.mjs "https://www.meshy.ai/s/FWTYRX"
+ * Запуск (открывает локальное окно в браузере):
+ *   node tools/model-get.mjs
+ *   node tools/model-get.mjs --port 7900 --no-open
+ *   node tools/model-get.mjs -o "D:\\Models"
+ *
+ * CLI-режим без окна:
+ *   node tools/model-get.mjs "https://www.meshy.ai/s/FWTYRX" "<tripo-ссылка>"
+ *
+ * Приватные модели Tripo: положи токен в переменную окружения TRIPO_TOKEN
+ * (Studio -> F12 -> Network -> любой запрос к api.tripo3d.ai -> authorization: Bearer <...>).
  *
  * FBX: если в системе есть Blender (`blender` в PATH или BLENDER=/path), в интерфейсе
  * появится выбор FBX — конвертация идёт локально через Blender. Без Blender остаётся GLB
- * (это родной формат Meshy; GLB открывают Blender, Unity, Unreal, Godot, three.js).
+ * (это родной формат обеих площадок; GLB открывают Blender, Unity, Unreal, Godot, three.js).
  */
 
 import http from 'node:http';
@@ -38,6 +41,10 @@ import { randomUUID } from 'node:crypto';
 const BASE = (process.env.MESHY_BASE || 'https://www.meshy.ai').replace(/\/$/, '');
 const TASK_API = `${BASE}/meshyd-api/web/public/v2/tasks/`;
 const LOADER_BASE = (process.env.MESHY_LOADER_BASE || `${BASE}/resource/decrypt/`).replace(/\/?$/, '/');
+// Tripo
+const TRIPO_API = (process.env.TRIPO_API_BASE || 'https://api.tripo3d.ai').replace(/\/$/, '');
+const TRIPO_TOKEN = process.env.TRIPO_TOKEN || '';
+const TRIPO_PROJECT_RE = (id) => `${TRIPO_API}/v2/studio/project/detail/v3/${id}?locale=en`;
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -62,28 +69,48 @@ function parseArgv(argv) {
 }
 
 const HELP = `
-meshy-get — вставь ссылку Meshy, получи GLB
+model-get — вставь ссылку (Meshy или Tripo), получи файл модели
 
-  node tools/meshy-get.mjs                 открыть окно в браузере (обычный режим)
-  node tools/meshy-get.mjs <ссылка> [...]  скачать сразу, без окна
-  node tools/meshy-get.mjs --fbx <ссылка>  ещё и FBX (нужен установленный Blender)
+  node tools/model-get.mjs                      открыть окно в браузере (обычный режим)
+  node tools/model-get.mjs <ссылка> [...]        скачать сразу, без окна
+  node tools/model-get.mjs --fbx <ссылка>        ещё и FBX (нужен установленный Blender)
+  node tools/model-get.mjs --doctor              самопроверка
+
+Понимает:
+  meshy  www.meshy.ai/s/XXXX · /3d-models/<slug>-<uuid> · task-id
+  tripo  studio.tripo3d.ai/workspace/{generate,texture,rigging,...}/<uuid>
+         studio.tripo3d.ai/3d-model/<uuid> · /s/<code> · просто uuid
 
 Опции:
-  --port <n>    порт локального сервера (по умолчанию 7878)
-  -o, --out <dir> папка для файлов (по умолчанию ~/Downloads/meshy)
-  --host <h>    адрес прослушивания (по умолчанию 127.0.0.1)
-  --no-open     не открывать браузер автоматически
-  --fbx         конвертировать в FBX через Blender, если он найден
-  --doctor      самопроверка: Node, сеть до Meshy, загрузка декриптора, подпись
-  -h, --help    эта справка
+  --port <n>      порт локального сервера (по умолчанию 7878)
+  -o, --out <dir> папка для файлов (по умолчанию ~/Downloads/models)
+  --host <h>      адрес прослушивания (по умолчанию 127.0.0.1)
+  --no-open       не открывать браузер автоматически
+  --fbx           конвертировать в FBX через Blender, если он найден
+  --doctor        самопроверка: Node, сеть, декриптор Meshy, подпись, API Tripo
+  -h, --help      эта справка
 
-Переменные окружения: MESHY_OUT, BLENDER, MESHY_BASE.
+Переменные окружения: MODELS_OUT (или MESHY_OUT), BLENDER, MESHY_BASE, TRIPO_TOKEN, TRIPO_API_BASE.
 `;
 
 function defaultOutDir() {
-  if (process.env.MESHY_OUT) return process.env.MESHY_OUT.replace(/^~(?=$|\/)/, os.homedir());
+  const fromEnv = process.env.MODELS_OUT || process.env.MESHY_OUT;
+  if (fromEnv) return fromEnv.replace(/^~(?=$|\/)/, os.homedir());
   const dl = path.join(os.homedir(), 'Downloads');
-  return fs.existsSync(dl) ? path.join(dl, 'meshy') : path.join(process.cwd(), 'meshy_models');
+  return fs.existsSync(dl) ? path.join(dl, 'models') : path.join(process.cwd(), 'models');
+}
+
+// ─── определение площадки ───────────────────────────────────────────────────
+function detectProvider(input) {
+  const s = String(input || '').toLowerCase();
+  // 1) по домену
+  if (/tripo3d\.(ai|com)|\btripo[-_.]/.test(s)) return 'tripo';
+  if (/meshy\.ai|\bmeshy[-_.]/.test(s)) return 'meshy';
+  // 2) по структуре пути (Meshy и Tripo не пересекаются)
+  if (/\/(workspace\/(generate|generate-image|segmentation|fill-parts|retopology|smart-uv|texture|texture-edit|texture-upscale|texture-pbr|rigging|animate)|3d-model)\//.test(s))
+    return 'tripo';
+  if (/\/3d-models\/|\/meshyd-api\//.test(s)) return 'meshy';
+  return null; // непонятно — пробуем Meshy, затем Tripo
 }
 
 // ─── поиск task-id ──────────────────────────────────────────────────────────
@@ -360,11 +387,92 @@ async function doctor() {
     }
   }
 
+  // Tripo: публичный проект читается без токена; проверяем сам API
+  let tripoOk = false;
+  let tripoExtra = '';
+  try {
+    const r = await fetch(`${TRIPO_API}/v2/studio/project/detail/v3/00000000-0000-0000-0000-000000000000?locale=en`, {
+      headers: { 'user-agent': UA, accept: 'application/json' },
+    });
+    tripoOk = r.status === 200 || r.status === 400 || r.status === 404;
+    tripoExtra = `HTTP ${r.status}${TRIPO_TOKEN ? ' · токен задан' : ' · без токена (публичные модели)'}`;
+  } catch (e) {
+    tripoExtra = e.message;
+  }
+  check('API Tripo доступен', tripoOk, tripoExtra);
+
   const blender = findBlender();
   check('Blender для FBX', !!blender, blender || 'не найден — GLB всё равно работает', { optional: true });
 
   console.log(bad ? `\n  Проблем: ${bad}. См. строки «ОШИБКА» выше.\n` : '\n  Всё в порядке — можно скачивать.\n');
   process.exit(bad ? 1 : 0);
+}
+
+// ─── Tripo: project-API -> подписанный model_url ─────────────────────────────
+async function tripoResolveId(input) {
+  let url = String(input).trim().replace(/^[<("'\s]+|[>)"'\s.,]+$/g, '');
+  if (!url) throw new Error('пустая ссылка');
+  if (!/^https?:/i.test(url)) {
+    if (UUID_RE.test(url)) return { id: url.match(UUID_RE)[0].toLowerCase() };
+    url = `https://studio.tripo3d.ai/s/${url.replace(/^.*\/s\//, '')}`;
+  }
+  const direct = url.match(UUID_RE);
+  if (direct) return { id: direct[0].toLowerCase() };
+  let res;
+  try {
+    res = await fetch(url, { headers: { 'user-agent': UA }, redirect: 'follow' });
+  } catch {
+    throw new Error('не удалось соединиться с studio.tripo3d.ai — проверь интернет/VPN или ссылку');
+  }
+  if (res.status === 404) throw new Error('страница Tripo не найдена (404) — проверь ссылку');
+  const finalUrl = res.url || url;
+  const m = finalUrl.match(UUID_RE);
+  if (!m) throw new Error('в ссылке Tripo нет id проекта (ожидался .../workspace/.../<uuid>)');
+  return { id: m[0].toLowerCase(), page: finalUrl };
+}
+
+async function tripoProject(id) {
+  const headers = {
+    'user-agent': UA,
+    accept: 'application/json',
+    origin: 'https://studio.tripo3d.ai',
+    referer: 'https://studio.tripo3d.ai/',
+  };
+  if (TRIPO_TOKEN) headers.authorization = `Bearer ${TRIPO_TOKEN.replace(/^Bearer\s+/i, '')}`;
+  let res;
+  try {
+    res = await fetch(TRIPO_PROJECT_RE(id), { headers });
+  } catch {
+    throw new Error('API Tripo недоступен — проверь интернет/VPN');
+  }
+  const text = await res.text();
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    throw new Error(`API Tripo вернул не JSON (HTTP ${res.status})`);
+  }
+  if (!res.ok || (body.code !== undefined && body.code !== 0)) {
+    const hint = TRIPO_TOKEN ? '' : ' Похоже, модель приватная — нужен TRIPO_TOKEN.';
+    throw new Error(`API Tripo: ${body.message || 'ошибка'} (code=${body.code}, HTTP ${res.status}).${hint}`);
+  }
+  if (!body.data) throw new Error('API Tripo не вернул проект');
+  return body.data;
+}
+
+const tripoModelUrl = (p) => p.model_url || p.operator?.model_url || '';
+
+function tripoInfo(project) {
+  const op = project.operator || {};
+  const gen = op.image_to_model || op.text_to_model || op.multiview_to_model || {};
+  return {
+    title: project.project_name,
+    licence: '',
+    polys: gen.face_limit ?? null,
+    verts: null,
+    generator: op.model_version || gen.model_version || '',
+    extra: [op.type, project.visibility].filter(Boolean).join(' · '),
+  };
 }
 
 // ─── собственно скачивание ──────────────────────────────────────────────────
@@ -377,74 +485,159 @@ const slugify = (s, fb = 'model') =>
     .replace(/^_|_$/g, '')
     .slice(0, 48) || fb;
 
-async function grab(link, { outDir, wantFbx, progress }) {
-  const { taskId, html } = await resolveLink(link);
-  progress?.({ stage: 'task', message: 'читаю информацию о модели' });
-  const task = await fetchTask(taskId);
-  if (task.status && task.status !== 'SUCCEEDED' && task.status !== 'SUCCEEDED')
-    progress?.({ stage: 'warn', message: `статус задачи: ${task.status}` });
+function glbInfo(buf) {
+  const info = checkGlb(buf);
+  return info;
+}
 
+async function grabMeshy(link, { outDir, progress }) {
+  const { taskId, html } = await resolveLink(link);
+  progress?.({ stage: 'task', message: 'Meshy: читаю информацию о модели' });
+  const task = await fetchTask(taskId);
   const picked = pickModel(task, html);
   const name = slugify(task.name || path.basename(new URL(picked.url).pathname, '.meshy'));
   const dir = path.join(outDir, `${taskId.slice(0, 8)}_${name}`);
   await fsp.mkdir(dir, { recursive: true });
 
-  progress?.({ stage: 'download', message: 'скачиваю файл модели', pct: 0 });
+  progress?.({ stage: 'download', message: 'Meshy: скачиваю файл модели', pct: 0 });
   let buf = await fetchBuffer(picked.url, (done, total) =>
-    progress?.({ stage: 'download', message: 'скачиваю файл модели', done, total, pct: total ? Math.round((done / total) * 100) : null }),
+    progress?.({ stage: 'download', message: 'Meshy: скачиваю файл модели', done, total, pct: total ? Math.round((done / total) * 100) : null }),
   );
   await fsp.writeFile(path.join(dir, 'source.meshy'), buf);
 
-  let outPath;
-  let info = null;
   if (buf.subarray(0, 8).toString() === 'MESHY.AI') {
-    progress?.({ stage: 'decrypt', message: 'расшифровываю .meshy → .glb' });
+    progress?.({ stage: 'decrypt', message: 'Meshy: расшифровываю .meshy → .glb' });
     buf = await decryptMeshy(buf);
   }
-  if (buf.subarray(0, 4).toString() === 'glTF') {
-    info = checkGlb(buf);
-    outPath = path.join(dir, `${name}.glb`);
-    await fsp.writeFile(outPath, buf);
-  } else {
-    outPath = path.join(dir, `${name}.bin`);
-    await fsp.writeFile(outPath, buf);
-    throw new Error('файл получен, но это не GLB и не .meshy — сохранён как .bin');
+  if (buf.subarray(0, 4).toString() !== 'glTF') {
+    const fallback = path.join(dir, `${name}.bin`);
+    await fsp.writeFile(fallback, buf);
+    throw Object.assign(new Error('Meshy вернул не GLB и не .meshy — сохранил как .bin'), { dir });
   }
-
-  let fbxPath = null;
-  if (wantFbx) {
-    progress?.({ stage: 'fbx', message: 'конвертирую в FBX через Blender' });
-    const bin = findBlender();
-    if (!bin) throw Object.assign(new Error('FBX: Blender не найден'), { glb: outPath, dir, info });
-    fbxPath = await toFbx(outPath, path.join(dir, `${name}.fbx`), bin);
-  }
-
-  const size = (await fsp.stat(outPath)).size;
-  const token = randomUUID();
-  files.set(token, { path: outPath, name: `${name}.glb` });
-  if (fbxPath) files.set(randomUUID(), { path: fbxPath, name: `${name}.fbx` });
-
+  const outPath = path.join(dir, `${name}.glb`);
+  await fsp.writeFile(outPath, buf);
   return {
-    ok: true,
-    taskId,
+    provider: 'meshy',
+    id: taskId,
     title: task.name || name,
     dir,
-    file: outPath,
-    size,
-    info,
+    outPath,
+    info: glbInfo(buf),
     licence: task.license || '',
     polys: task.faceCount ?? task.triangleCount ?? null,
     verts: task.vertexCount ?? null,
-    downloadUrl: `/file/${[...files.entries()].find(([, v]) => v.path === outPath)[0]}`,
-    fbxUrl: fbxPath ? `/file/${[...files.entries()].find(([, v]) => v.path === fbxPath)[0]}` : null,
+    note: [task.mode, task.topology].filter(Boolean).join(' · '),
   };
+}
+
+async function grabTripo(link, { outDir, progress }) {
+  const { id, page } = await tripoResolveId(link);
+  progress?.({ stage: 'task', message: 'Tripo: читаю информацию о проекте' });
+  const project = await tripoProject(id);
+  const url = tripoModelUrl(project);
+  if (!url) throw new Error('у проекта Tripo ещё нет модели (генерация не завершена?)');
+
+  const meta = tripoInfo(project);
+  const name = slugify(meta.title || `tripo_${id.slice(0, 8)}`);
+  const dir = path.join(outDir, `${id.slice(0, 8)}_${name}`);
+  await fsp.mkdir(dir, { recursive: true });
+
+  const srcName = path.basename(new URL(url).pathname) || 'model.glb';
+  const ext = (path.extname(srcName) || '.glb').toLowerCase();
+  progress?.({ stage: 'download', message: `Tripo: скачиваю ${srcName}`, pct: 0 });
+  const buf = await fetchBuffer(url, (done, total) =>
+    progress?.({ stage: 'download', message: `Tripo: скачиваю ${srcName}`, done, total, pct: total ? Math.round((done / total) * 100) : null }),
+  );
+  const outPath = path.join(dir, `${name}${ext}`);
+  await fsp.writeFile(outPath, buf);
+
+  const head = buf.subarray(0, 4).toString();
+  let info = null;
+  if (head === 'glTF') info = glbInfo(buf);
+  else if (ext !== '.glb') {
+    // fbx/obj/stl и прочее отдаём как есть — это нормальный результат Tripo
+    info = { meshes: 0, materials: 0, textures: 0, generator: ext.slice(1).toUpperCase() };
+  } else {
+    throw Object.assign(new Error('Tripo вернул файл, но это не GLB — сохранён рядом'), { dir });
+  }
+
+  return {
+    provider: 'tripo',
+    id,
+    title: meta.title || name,
+    dir,
+    outPath,
+    info,
+    licence: meta.licence,
+    polys: meta.polys,
+    verts: meta.verts,
+    note: meta.extra,
+    sourceFormat: ext.replace('.', ''),
+    page,
+  };
+}
+
+async function grab(link, { outDir, wantFbx, progress }) {
+  const guess = detectProvider(link);
+  let res;
+  if (guess === 'tripo') {
+    res = await grabTripo(link, { outDir, progress });
+  } else if (guess === 'meshy') {
+    res = await grabMeshy(link, { outDir, progress });
+  } else {
+    // ссылка без явного домена (например, просто uuid) — пробуем Meshy, потом Tripo
+    try {
+      res = await grabMeshy(link, { outDir, progress });
+    } catch (e) {
+      progress?.({ stage: 'task', message: 'не Meshy — пробую Tripo' });
+      res = await grabTripo(link, { outDir, progress });
+    }
+  }
+
+  // регистрируем файл для скачивания браузером
+  const size = (await fsp.stat(res.outPath)).size;
+  const token = randomUUID();
+  const fileName = path.basename(res.outPath);
+  files.set(token, { path: res.outPath, name: fileName });
+  const result = {
+    ok: true,
+    provider: res.provider,
+    taskId: res.id,
+    title: res.title,
+    dir: res.dir,
+    file: res.outPath,
+    size,
+    info: res.info,
+    licence: res.licence || '',
+    polys: res.polys ?? null,
+    verts: res.verts ?? null,
+    note: res.note || '',
+    format: (path.extname(fileName) || '.glb').slice(1),
+    downloadUrl: `/file/${token}`,
+    fbxUrl: null,
+  };
+
+  // FBX через Blender (только если это GLB и Blender есть)
+  if (wantFbx) {
+    progress?.({ stage: 'fbx', message: 'конвертирую в FBX через Blender' });
+    const bin = findBlender();
+    if (!bin) throw Object.assign(new Error('FBX: Blender не найден — GLB уже скачан'), { ...result, glb: res.outPath });
+    if (result.format !== 'glb')
+      throw Object.assign(new Error('FBX делается только из GLB — этот файл уже в другом формате'), { ...result, glb: res.outPath });
+    const fbxPath = await toFbx(res.outPath, path.join(res.dir, `${path.basename(res.outPath, '.glb')}.fbx`), bin);
+    const fbxToken = randomUUID();
+    files.set(fbxToken, { path: fbxPath, name: path.basename(fbxPath) });
+    result.fbxUrl = `/file/${fbxToken}`;
+  }
+
+  return result;
 }
 
 // ─── веб-интерфейс ──────────────────────────────────────────────────────────
 const PAGE = `<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Meshy → GLB</title>
+<title>Meshy & Tripo → GLB</title>
 <style>
   :root{--bg:#0d0f14;--card:#161a22;--line:#252b36;--fg:#e8ecf3;--mut:#8b95a7;--acc:#6ea8ff;--ok:#4ade80;--err:#f87171}
   *{box-sizing:border-box}
@@ -476,10 +669,10 @@ const PAGE = `<!doctype html>
   .tag{font-size:11px;padding:2px 8px;border-radius:99px;background:#1c2331;color:var(--mut);border:1px solid var(--line)}
   select{background:#0f131a;color:var(--fg);border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:13.5px}
 </style></head><body><div class="wrap">
-  <h1>Meshy → GLB</h1>
-  <div class="sub">Вставь ссылку на модель, нажми «Скачать». Файл сохранится в папку <code id="outdir"></code> и начнёт качаться в браузер.</div>
+  <h1>Meshy &amp; Tripo → GLB</h1>
+  <div class="sub">Вставь ссылку на модель (Meshy или Tripo), нажми «Скачать». Файл сохранится в папку <code id="outdir"></code> и начнёт качаться в браузер.</div>
   <div class="card">
-    <textarea id="links" placeholder="https://www.meshy.ai/s/FWTYRX&#10;https://www.meshy.ai/3d-models/My-Model-01a1ec88-...&#10;(можно несколько ссылок, по одной в строке)"></textarea>
+    <textarea id="links" placeholder="https://www.meshy.ai/s/FWTYRX&#10;https://studio.tripo3d.ai/workspace/generate/ea82c134-4ce8-4558-8922-6045de828ccf&#10;(можно несколько ссылок, по одной в строке; площадка определяется сама)"></textarea>
     <div class="row">
       <button id="go">Скачать</button>
       <button id="clear" class="ghost">Очистить</button>
@@ -497,13 +690,20 @@ const out = document.getElementById('out');
 const go = document.getElementById('go');
 const fmt = document.getElementById('fmt');
 const envEl = document.getElementById('env');
-envEl.textContent = 'Blender: ' + CFG.blender;
+envEl.textContent = 'Blender: ' + CFG.blender + ' · Tripo: ' + CFG.tripo;
 
+function providerOf(url){
+  const s = String(url).toLowerCase();
+  if (/tripo3d|tripo[-_.]/.test(s)) return 'Tripo';
+  if (/meshy/.test(s)) return 'Meshy';
+  return '?';
+}
 function card(url){
   const el = document.createElement('div');
   el.className = 'item';
-  el.innerHTML = '<div class="t"><span class="tag">ждёт</span><span class="ti"></span></div>'+
+  el.innerHTML = '<div class="t"><span class="tag src"></span><span class="tag">ждёт</span><span class="ti"></span></div>'+
                  '<div class="m msg">в очереди…</div><div class="bar" style="display:none"><i></i></div>';
+  el.querySelector('.src').textContent = providerOf(url);
   el.querySelector('.ti').textContent = url.length > 70 ? url.slice(0,70)+'…' : url;
   el.dataset.url = url;
   out.prepend(el);
@@ -545,9 +745,12 @@ async function one(url){
     if (d.verts) meta.push(d.verts.toLocaleString('ru-RU') + ' вершин');
     if (d.info) { meta.push(d.info.textures ? d.info.textures + ' текстур' : 'без текстур'); }
     if (d.licence) meta.push('лицензия ' + d.licence.toUpperCase());
+    if (d.provider) el.querySelector('.src').textContent = d.provider === 'tripo' ? 'Tripo' : 'Meshy';
+    if (d.note) meta.unshift(d.note);
     setMsg(el, (d.title ? d.title + ' · ' : '') + meta.join(' · '));
     const a = document.createElement('a');
-    a.className='dl'; a.href = d.downloadUrl; a.textContent = '⬇ Скачать GLB (' + (d.size/1048576).toFixed(1) + ' МБ)';
+    const fmtLabel = (d.format || 'glb').toUpperCase();
+    a.className='dl'; a.href = d.downloadUrl; a.textContent = '⬇ Скачать ' + fmtLabel + ' (' + (d.size/1048576).toFixed(1) + ' МБ)';
     el.appendChild(a);
     if (d.fbxUrl) { const b=document.createElement('a'); b.className='dl'; b.style.marginLeft='8px'; b.href=d.fbxUrl; b.textContent='⬇ FBX'; el.appendChild(b); }
   } catch (e) {
@@ -627,7 +830,7 @@ async function main() {
           },
         });
         process.stdout.write('\r');
-        console.log(`  ✓ ${r.file} (${(r.size / 1048576).toFixed(1)} МБ)`);
+        console.log(`  ✓ [${r.provider}] ${r.file} (${(r.size / 1048576).toFixed(1)} МБ)`);
         if (r.info)
           console.log(`    ${r.info.meshes} mesh · ${r.info.materials} material · ${r.info.textures} texture`);
       } catch (e) {
@@ -644,6 +847,7 @@ async function main() {
   const cfg = JSON.stringify({
     out: outDir,
     blender: blender ? path.basename(blender) : 'не найден (только GLB)',
+    tripo: TRIPO_TOKEN ? 'токен есть' : 'без токена (только публичные)',
   }).replace(/</g, '\\u003c');
   const page = PAGE.replace('__CFG__', cfg);
 
@@ -698,9 +902,10 @@ async function main() {
 
   await new Promise((resolve) => server.listen(opts.port, opts.host, resolve));
   const local = `http://${opts.host === '0.0.0.0' ? 'localhost' : opts.host}:${opts.port}`;
-  console.log(`\n  Meshy → GLB  ·  ${local}`);
+  console.log(`\n  Meshy & Tripo → GLB  ·  ${local}`);
   console.log(`  файлы: ${outDir}`);
-  console.log(`  Blender: ${blender || 'не найден (FBX недоступен, GLB работает всегда)'}`);
+  console.log(`  Blender: ${blender || 'не найден (FBX недоступен, GLB/FBX с площадок работает всегда)'}`);
+  console.log(`  Tripo:   ${TRIPO_TOKEN ? 'токен задан (доступны приватные модели)' : 'без токена — только публичные модели'}`);
   console.log('  Ctrl+C — выйти\n');
   if (opts.open) openBrowser(local);
 }
